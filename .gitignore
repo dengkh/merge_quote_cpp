@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Data & output
+output/
+*.parquet
+*.npy
+
+# Backup files
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
