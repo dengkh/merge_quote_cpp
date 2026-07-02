@@ -13,6 +13,12 @@ parquet_sort_deploy.tar.gz
 *.log*
 *.out*
 nohup.out
+logs_*/
+logs_*.txt
+
+# Local data / scratch (large, not for VCS)
+test/
+data_20210423/
 
 # Python cache
 __pycache__/

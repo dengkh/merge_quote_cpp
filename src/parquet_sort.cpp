@@ -1,14 +1,13 @@
-// parquet_sort.cpp  –  C++ port of parquet_sort_modified.py + sorted_npy_merge.py
+// parquet_sort.cpp  –  K-way merge sort for tick / order / trans parquet quote data.
 //
-// Stage 1: K-way merge sort for tick / order / trans parquet quote data.
-// Stage 2: Join with NPY local times, re-merge front half, per-type output.
-//
-// Sorting rules (identical to Python version):
-//   1. time ascending  (exchange_time in nanoseconds)
+// Sorting rules:
+//   1. exchange_time ascending (nanoseconds)
 //   2. type priority   (tick=0 < order=1 < trans=2)
 //   3. stock code asc
 //   For SH channels: biz_index ordering takes priority within each channel.
 //   For SZ channels: ApplSeq (order_index/trade_index) ordering within each channel.
+//
+// Output: per-type parquet with local_time = exchange_time.
 //
 // Build:
 //   mkdir build && cd build && cmake .. && make -j
@@ -21,7 +20,6 @@
 #include <parquet/arrow/writer.h>
 
 #include <algorithm>
-#include <numeric>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -30,7 +28,6 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
-#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -38,14 +35,12 @@
 #include <vector>
 
 #include "kway_merge.h"
-#include "npy_reader.h"
 
 namespace fs = std::filesystem;
 
 // ── Constants ────────────────────────────────────────────────────────
 
 static constexpr int64_t CHUNK_SIZE           = 20'000'000;
-static constexpr int32_t SH_CHANNEL_THRESHOLD = 1000;
 
 // ── Logging ──────────────────────────────────────────────────────────
 
@@ -261,16 +256,24 @@ static std::shared_ptr<arrow::Table> promote_to_large(
         auto tid = fld->type()->id();
 
         std::shared_ptr<arrow::DataType> new_type;
-        if (tid == arrow::Type::BINARY)
-            new_type = arrow::large_binary();
-        else if (tid == arrow::Type::STRING)
+        if (tid == arrow::Type::BINARY || tid == arrow::Type::LARGE_BINARY)
+            new_type = arrow::large_utf8();
+        else if (tid == arrow::Type::STRING || tid == arrow::Type::LARGE_STRING)
             new_type = arrow::large_utf8();
         else if (tid == arrow::Type::LIST) {
             auto lt = std::static_pointer_cast<arrow::ListType>(fld->type());
             new_type = arrow::large_list(lt->value_type());
         }
+        else if (tid == arrow::Type::LARGE_LIST)
+            continue;
+        else if (tid == arrow::Type::FIXED_SIZE_LIST) {
+            auto flt = std::static_pointer_cast<arrow::FixedSizeListType>(fld->type());
+            new_type = arrow::large_list(flt->value_type());
+        }
         else
             continue;
+
+        if (fld->type()->Equals(new_type)) continue;
 
         arrow::compute::CastOptions opts;
         opts.to_type = new_type;
@@ -601,22 +604,6 @@ static std::shared_ptr<arrow::Table> build_sorted_batch(
     });
 }
 
-// ── compute_local_time ───────────────────────────────────────────────
-
-static std::vector<int64_t> compute_local_time(
-    const int64_t* sort_time, int64_t n,
-    std::optional<int64_t> prev_last)
-{
-    std::vector<int64_t> adj(n);
-    for (int64_t i = 0; i < n; ++i) adj[i] = sort_time[i] - i;
-    if (prev_last.has_value() && n > 0)
-        adj[0] = std::max(adj[0], *prev_last + 1);
-    for (int64_t i = 1; i < n; ++i)
-        adj[i] = std::max(adj[i], adj[i - 1]);
-    for (int64_t i = 0; i < n; ++i) adj[i] += i;
-    return adj;
-}
-
 // ── SeqData (owns memory) ────────────────────────────────────────────
 
 struct SeqData {
@@ -632,471 +619,25 @@ struct SeqData {
     }
 };
 
-// ══════════════════════════════════════════════════════════════════════
-// Stage 2: NPY merge helpers
-// ══════════════════════════════════════════════════════════════════════
+// ── Per-type output: unnest struct, set local_time=exchange_time ──────
 
-static int64_t compute_cutoff_ns(const std::string& date_str) {
-    int y = std::stoi(date_str.substr(0, 4));
-    int m = std::stoi(date_str.substr(4, 2));
-    int d = std::stoi(date_str.substr(6, 2));
-    struct tm tm = {};
-    tm.tm_year = y - 1900; tm.tm_mon = m - 1; tm.tm_mday = d;
-    tm.tm_hour = 9; tm.tm_min = 40; tm.tm_sec = 0;
-    // CST = UTC+8
-    time_t utc = timegm(&tm) - 8 * 3600;
-    return static_cast<int64_t>(utc) * 1'000'000'000LL;
-}
-
-// ── Hash key for joins ───────────────────────────────────────────────
-
-struct JoinKey {
-    int64_t a, b;
-    bool operator==(const JoinKey& o) const { return a == o.a && b == o.b; }
-};
-struct JoinKeyHash {
-    size_t operator()(const JoinKey& k) const {
-        size_t h = std::hash<int64_t>{}(k.a);
-        h ^= std::hash<int64_t>{}(k.b) * 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
-// ── Per-type front join result ───────────────────────────────────────
-// After joining with NPY, each type's front half is described by arrays
-// that will feed into the K-way re-merge.
-
-struct FrontJoined {
-    int64_t n = 0;
-    std::vector<int64_t>  local_time;
-    std::vector<int8_t>   type_priority;
-    std::vector<int64_t>  stock_code;
-    std::vector<int32_t>  channel;   // -1 for tick
-    std::vector<int64_t>  ch_seq;    //  0 for tick; SH: biz_index, SZ: order_index/trade_index (ApplSeq)
-    std::vector<int64_t>  src_row;   // row index in the front_type Arrow table
-};
-
-// ── Tick right join ──────────────────────────────────────────────────
-// NPY drives: output = all NPY rows that have matching parquet rows.
-// Positional matching within each (ticker, exch_time) group.
-
-static FrontJoined join_tick_front(
-    const std::shared_ptr<arrow::Table>& front_tick,
-    const npy::TickData& npy)
-{
-    auto t0 = now_sec();
-    int64_t n_pq = front_tick->num_rows();
-
-    // Extract join keys from tick_data struct
-    auto struct_col = std::static_pointer_cast<arrow::StructArray>(
-        combine_chunks(front_tick->GetColumnByName("tick_data")));
-    auto pq_ticker = struct_field_i64(struct_col, "ticker");
-    auto pq_et_field = struct_col->GetFieldByName("exch_time");
-    // Cast exch_time to int64 for uniform key
-    auto pq_et = struct_field_i64(struct_col, "exch_time");
-
-    auto pq_sc = std::static_pointer_cast<arrow::Int64Array>(
-        combine_chunks(front_tick->GetColumnByName("stock_code")));
-
-    // Filter NPY to tickers present in parquet
-    std::set<int64_t> pq_tickers_set;
-    for (int64_t i = 0; i < n_pq; ++i) pq_tickers_set.insert(pq_ticker->Value(i));
-
-    // Build parquet groups: (ticker, exch_time) → ordered list of row indices
-    std::unordered_map<JoinKey, std::vector<int64_t>, JoinKeyHash> pq_groups;
-    pq_groups.reserve(n_pq);
-    for (int64_t i = 0; i < n_pq; ++i) {
-        JoinKey key{pq_ticker->Value(i), pq_et->Value(i)};
-        pq_groups[key].push_back(i);
-    }
-
-    int64_t n_npy_filtered = 0;
-    int64_t n_npy_zero_field = 0;
-    int64_t n_null_ticker_missing = 0;
-    for (int64_t i = 0; i < npy.n; ++i) {
-        if (npy.ticker[i] == 0 || npy.exch_time[i] == 0) { ++n_npy_zero_field; continue; }
-        if (pq_tickers_set.count(npy.ticker[i]) == 0) { ++n_null_ticker_missing; continue; }
-        ++n_npy_filtered;
-    }
-    LOG("  tick join: %ld pq rows, %ld/%ld npy rows after filter",
-        n_pq, n_npy_filtered, npy.n);
-
-    // Iterate NPY in file order (preserves NPY's natural local_time ordering,
-    // matching the Python right-join which keeps the right-table order).
-    // Per-group positional counter for duplicate (ticker, exch_time) keys.
-    std::unordered_map<JoinKey, int64_t, JoinKeyHash> group_cursor;
-    FrontJoined result;
-    result.local_time.reserve(n_npy_filtered);
-    result.type_priority.reserve(n_npy_filtered);
-    result.stock_code.reserve(n_npy_filtered);
-    result.channel.reserve(n_npy_filtered);
-    result.ch_seq.reserve(n_npy_filtered);
-    result.src_row.reserve(n_npy_filtered);
-
-    int64_t n_dropped_pq = 0;
-    int64_t n_npy_no_match = 0;
-    for (int64_t i = 0; i < npy.n; ++i) {
-        if (npy.ticker[i] == 0 || npy.exch_time[i] == 0) continue;
-        if (pq_tickers_set.count(npy.ticker[i]) == 0) continue;
-        JoinKey key{npy.ticker[i], static_cast<int64_t>(npy.exch_time[i])};
-        auto pq_it = pq_groups.find(key);
-        if (pq_it == pq_groups.end()) {
-            ++n_npy_no_match;
-            continue;
-        }
-        auto& pq_idx_vec = pq_it->second;
-        int64_t pos = group_cursor[key]++;
-        if (pos >= static_cast<int64_t>(pq_idx_vec.size())) continue;
-        int64_t pi = pq_idx_vec[pos];
-        result.local_time.push_back(npy.local_time[i]);
-        result.type_priority.push_back(0);
-        result.stock_code.push_back(pq_sc->Value(pi));
-        result.channel.push_back(-1);
-        result.ch_seq.push_back(0);
-        result.src_row.push_back(pi);
-    }
-    result.n = static_cast<int64_t>(result.local_time.size());
-
-    // Count dropped parquet rows (those with more duplicates than NPY)
-    for (auto& [key, pq_idx_vec] : pq_groups) {
-        auto it = group_cursor.find(key);
-        int64_t used = (it != group_cursor.end()) ? it->second : 0;
-        if (used < static_cast<int64_t>(pq_idx_vec.size()))
-            n_dropped_pq += static_cast<int64_t>(pq_idx_vec.size()) - used;
-    }
-
-    int64_t total_null = n_npy_zero_field + n_null_ticker_missing + n_npy_no_match;
-    LOG("  tick right-join null (NPY key not in parquet): %ld / %ld",
-        total_null, npy.n);
-    if (n_npy_zero_field > 0)
-        LOG("    - ticker=0 or exch_time=0: %ld", n_npy_zero_field);
-    if (n_null_ticker_missing > 0)
-        LOG("    - ticker not in parquet: %ld", n_null_ticker_missing);
-    if (n_npy_no_match > 0)
-        LOG("    - (ticker,exch_time) key not in parquet: %ld", n_npy_no_match);
-    if (n_dropped_pq > 0)
-        LOG("  tick: %ld parquet rows dropped (more duplicates than NPY)", n_dropped_pq);
-    LOG("  tick join: %ld output rows (%.1fs)", result.n, now_sec() - t0);
-    return result;
-}
-
-// ── Tick left join (parquet drives) ──────────────────────────────────
-// All parquet rows kept, NPY local_time used when matched.
-
-static FrontJoined join_tick_front_left(
-    const std::shared_ptr<arrow::Table>& front_tick,
-    const npy::TickData& npy)
-{
-    auto t0 = now_sec();
-    int64_t n_pq = front_tick->num_rows();
-
-    auto struct_col = std::static_pointer_cast<arrow::StructArray>(
-        combine_chunks(front_tick->GetColumnByName("tick_data")));
-    auto pq_ticker = struct_field_i64(struct_col, "ticker");
-    auto pq_et = struct_field_i64(struct_col, "exch_time");
-    auto pq_sc = std::static_pointer_cast<arrow::Int64Array>(
-        combine_chunks(front_tick->GetColumnByName("stock_code")));
-    auto orig_lt_arr = std::static_pointer_cast<arrow::Int64Array>(
-        combine_chunks(front_tick->GetColumnByName("local_time")));
-
-    // Build NPY groups: (ticker, exch_time) → ordered list of local_times
-    std::unordered_map<JoinKey, std::vector<int64_t>, JoinKeyHash> npy_groups;
-    int64_t n_npy_zero_field = 0;
-    for (int64_t i = 0; i < npy.n; ++i) {
-        if (npy.ticker[i] == 0 || npy.exch_time[i] == 0) { ++n_npy_zero_field; continue; }
-        JoinKey key{npy.ticker[i], static_cast<int64_t>(npy.exch_time[i])};
-        npy_groups[key].push_back(npy.local_time[i]);
-    }
-    if (n_npy_zero_field > 0)
-        LOG("  tick NPY: %ld rows with ticker=0 or exch_time=0", n_npy_zero_field);
-
-    // Left join: iterate parquet (all rows kept)
-    std::unordered_map<JoinKey, int64_t, JoinKeyHash> group_cursor;
-    FrontJoined result;
-    result.n = n_pq;
-    result.local_time.resize(n_pq);
-    result.type_priority.assign(n_pq, 0);
-    result.stock_code.resize(n_pq);
-    result.channel.assign(n_pq, -1);
-    result.ch_seq.assign(n_pq, 0);
-    result.src_row.resize(n_pq);
-
-    int64_t n_matched = 0;
-    int64_t n_null = 0;
-    for (int64_t i = 0; i < n_pq; ++i) {
-        JoinKey key{pq_ticker->Value(i), pq_et->Value(i)};
-        auto npy_it = npy_groups.find(key);
-        if (npy_it != npy_groups.end()) {
-            int64_t pos = group_cursor[key]++;
-            if (pos < static_cast<int64_t>(npy_it->second.size())) {
-                result.local_time[i] = npy_it->second[pos];
-                ++n_matched;
-            } else {
-                result.local_time[i] = orig_lt_arr->Value(i);
-                ++n_null;
-            }
-        } else {
-            result.local_time[i] = orig_lt_arr->Value(i);
-            ++n_null;
-        }
-        result.stock_code[i] = pq_sc->Value(i);
-        result.src_row[i] = i;
-    }
-
-    LOG("  tick left-join null (parquet key not in NPY): %ld / %ld",
-        n_null, n_pq);
-    LOG("  tick join: %ld rows, %ld/%ld npy matched (%.1fs)",
-        n_pq, n_matched, npy.n, now_sec() - t0);
-    return result;
-}
-
-// ── Trans / Order left join ──────────────────────────────────────────
-// Parquet drives: all rows kept, NPY local_time used when available.
-
-static FrontJoined join_channel_front(
-    const std::shared_ptr<arrow::Table>& front_table,
-    const npy::ChannelData& npy,
-    int8_t type_pri,
-    const std::string& struct_col_name,
-    const std::string& index_field_name)
-{
-    auto t0 = now_sec();
-    int64_t n_pq = front_table->num_rows();
-
-    auto struct_col = std::static_pointer_cast<arrow::StructArray>(
-        combine_chunks(front_table->GetColumnByName(struct_col_name)));
-    auto pq_ch = struct_field_i64(struct_col, "channel");
-    auto pq_idx = struct_field_i64(struct_col, index_field_name);
-
-    // Read biz_index for SH merge key
-    auto pq_biz = struct_field_i64(struct_col, "biz_index");
-
-    auto pq_sc = std::static_pointer_cast<arrow::Int64Array>(
-        combine_chunks(front_table->GetColumnByName("stock_code")));
-
-    auto orig_lt_arr = std::static_pointer_cast<arrow::Int64Array>(
-        combine_chunks(front_table->GetColumnByName("local_time")));
-
-    // Build NPY lookup: (channel, index) → npy_local_time
-    // NPY key always uses order_index/trade_index for the join
-    std::unordered_map<JoinKey, int64_t, JoinKeyHash> npy_map;
-    npy_map.reserve(npy.n);
-    for (int64_t i = 0; i < npy.n; ++i) {
-        npy_map[{static_cast<int64_t>(npy.channel[i]), npy.index[i]}] = npy.local_time[i];
-    }
-
-    FrontJoined result;
-    result.n = n_pq;
-    result.local_time.resize(n_pq);
-    result.type_priority.assign(n_pq, type_pri);
-    result.stock_code.resize(n_pq);
-    result.channel.resize(n_pq);
-    result.ch_seq.resize(n_pq);
-    result.src_row.resize(n_pq);
-
-    int64_t n_matched = 0;
-    int64_t n_npy_no_match = 0;
-    for (int64_t i = 0; i < n_pq; ++i) {
-        JoinKey key{pq_ch->Value(i), pq_idx->Value(i)};
-        auto it = npy_map.find(key);
-        if (it != npy_map.end()) {
-            result.local_time[i] = it->second;
-            ++n_matched;
-        } else {
-            result.local_time[i] = orig_lt_arr->Value(i);
-            ++n_npy_no_match;
-        }
-        result.stock_code[i] = pq_sc->Value(i);
-        result.channel[i] = static_cast<int32_t>(pq_ch->Value(i));
-        // ch_seq = merge key: biz_index for SH, order_index/trade_index for SZ
-        int64_t biz = pq_biz->Value(i);
-        result.ch_seq[i] = (biz != 0) ? biz : pq_idx->Value(i);
-        result.src_row[i] = i;
-    }
-
-    const char* label = (type_pri == 1) ? "order" : "trans";
-    LOG("  %s left-join null (parquet key not in NPY): %ld / %ld",
-        label, n_npy_no_match, n_pq);
-    LOG("  %s join: %ld rows, %ld/%ld npy matched (%.1fs)",
-        label, n_pq, n_matched, npy.n, now_sec() - t0);
-    return result;
-}
-
-// ── Front K-way re-merge ─────────────────────────────────────────────
-// K-way merge tick + per-channel order + per-channel trans by (local_time, stock_code).
-// Unlike Stage 1 back-half, order and trans per channel are SEPARATE sequences
-// (no biz_index/applseq two-way merge within a channel).
-
-struct FrontMergeResult {
-    std::vector<int64_t> tick_indices, tick_lt;
-    std::vector<int64_t> order_indices, order_lt;
-    std::vector<int64_t> trans_indices, trans_lt;
-    int64_t last_lt = 0;
-};
-
-// Per-sequence storage for the front K-way merge (owns its arrays).
-struct FrontSeqData {
-    std::vector<int64_t>  times;
-    std::vector<int8_t>   types;   // all set to 0 so HeapEntry compares (time, code)
-    std::vector<int64_t>  codes;
-    std::vector<uint32_t> locs;    // index into flat front arrays
-};
-
-static FrontMergeResult kway_merge_front(
-    FrontJoined& tick_j, FrontJoined& order_j, FrontJoined& trans_j)
-{
-    auto t0 = now_sec();
-
-    int64_t n_total = tick_j.n + order_j.n + trans_j.n;
-
-    // ── 1. Build per-channel per-type sequences ─────────────────────
-
-    // Flat arrays that map merge-output position → (type_id, src_row)
-    // We pack: tick rows at offset 0, order at tick_j.n, trans at tick_j.n+order_j.n
-    std::vector<int8_t>  flat_type_id(n_total);
-    std::vector<int64_t> flat_src_row(n_total);
-    std::vector<int64_t> flat_lt(n_total);
-
-    for (int64_t i = 0; i < tick_j.n; ++i) {
-        flat_type_id[i] = 0; flat_src_row[i] = tick_j.src_row[i]; flat_lt[i] = tick_j.local_time[i];
-    }
-    int64_t off_o = tick_j.n;
-    for (int64_t i = 0; i < order_j.n; ++i) {
-        flat_type_id[off_o + i] = 1; flat_src_row[off_o + i] = order_j.src_row[i]; flat_lt[off_o + i] = order_j.local_time[i];
-    }
-    int64_t off_t = tick_j.n + order_j.n;
-    for (int64_t i = 0; i < trans_j.n; ++i) {
-        flat_type_id[off_t + i] = 2; flat_src_row[off_t + i] = trans_j.src_row[i]; flat_lt[off_t + i] = trans_j.local_time[i];
-    }
-
-    std::vector<FrontSeqData> sequences;
-
-    // 1a. tick: single sequence
-    {
-        FrontSeqData s;
-        s.times.resize(tick_j.n); s.types.assign(tick_j.n, 0);
-        s.codes.resize(tick_j.n); s.locs.resize(tick_j.n);
-        for (int64_t i = 0; i < tick_j.n; ++i) {
-            s.times[i] = tick_j.local_time[i];
-            s.codes[i] = tick_j.stock_code[i];
-            s.locs[i]  = static_cast<uint32_t>(i); // flat offset = i
-        }
-        sequences.push_back(std::move(s));
-    }
-
-    // 1b. Group order rows by channel
-    auto build_channel_seqs = [&](FrontJoined& j, int64_t flat_offset) {
-        std::map<int32_t, std::vector<int64_t>> by_ch;
-        for (int64_t i = 0; i < j.n; ++i)
-            by_ch[j.channel[i]].push_back(i);
-
-        for (auto& [ch, indices] : by_ch) {
-            FrontSeqData s;
-            s.times.resize(indices.size()); s.types.assign(indices.size(), 0);
-            s.codes.resize(indices.size()); s.locs.resize(indices.size());
-            for (size_t k = 0; k < indices.size(); ++k) {
-                int64_t i = indices[k];
-                s.times[k] = j.local_time[i];
-                s.codes[k] = j.stock_code[i];
-                s.locs[k]  = static_cast<uint32_t>(flat_offset + i);
-            }
-            sequences.push_back(std::move(s));
-        }
-    };
-
-    build_channel_seqs(order_j, off_o);
-    int n_order_ch = static_cast<int>(sequences.size()) - 1;  // minus tick
-    build_channel_seqs(trans_j, off_t);
-    int n_seqs = static_cast<int>(sequences.size());
-    int n_trans_ch = n_seqs - 1 - n_order_ch;
-    LOG("  front: %d sequences (1 tick + %d order-ch + %d trans-ch), %ld total rows",
-        n_seqs, n_order_ch, n_trans_ch, n_total);
-
-    // ── 2. K-way merge ──────────────────────────────────────────────
-
-    std::vector<MergeSequence> merge_seqs(n_seqs);
-    for (int i = 0; i < n_seqs; ++i) {
-        merge_seqs[i].times  = sequences[i].times.data();
-        merge_seqs[i].types  = sequences[i].types.data();
-        merge_seqs[i].codes  = sequences[i].codes.data();
-        merge_seqs[i].locs   = sequences[i].locs.data();
-        merge_seqs[i].length = static_cast<int64_t>(sequences[i].times.size());
-    }
-
-    std::vector<uint8_t>  out_src(n_total);
-    std::vector<uint32_t> out_loc(n_total);
-    kway_merge(merge_seqs, out_src.data(), out_loc.data(), n_total);
-
-    LOG("  front K-way merge done (%.1fs): %ld rows, heap size %d",
-        now_sec() - t0, n_total, n_seqs);
-
-    // ── 3. Dedup local_time (strictly increasing) ───────────────────
-
-    std::vector<int64_t> merged_lt(n_total);
-    for (int64_t i = 0; i < n_total; ++i)
-        merged_lt[i] = flat_lt[out_loc[i]];
-    for (int64_t i = 1; i < n_total; ++i)
-        if (merged_lt[i] <= merged_lt[i - 1]) merged_lt[i] = merged_lt[i - 1] + 1;
-
-    // ── 4. Split by type → FrontMergeResult ─────────────────────────
-
-    FrontMergeResult result;
-    for (int64_t i = 0; i < n_total; ++i) {
-        uint32_t flat_idx = out_loc[i];
-        int8_t   tid = flat_type_id[flat_idx];
-        int64_t  sr  = flat_src_row[flat_idx];
-        int64_t  lt  = merged_lt[i];
-        switch (tid) {
-            case 0: result.tick_indices.push_back(sr);  result.tick_lt.push_back(lt);  break;
-            case 1: result.order_indices.push_back(sr); result.order_lt.push_back(lt); break;
-            case 2: result.trans_indices.push_back(sr); result.trans_lt.push_back(lt); break;
-        }
-    }
-    result.last_lt = merged_lt.empty() ? 0 : merged_lt.back();
-
-    LOG("  front merge done (%.1fs): tick=%zu order=%zu trans=%zu, last_lt=%ld",
-        now_sec() - t0,
-        result.tick_indices.size(), result.order_indices.size(),
-        result.trans_indices.size(), result.last_lt);
-    return result;
-}
-
-// ── Unnest struct + write per-type output ────────────────────────────
-// Flatten the struct column into top-level columns, replace inner
-// local_time with the outer merged one.
-
-static void write_type_output(
+static void write_type_output_simple(
     const std::string& label,
     const std::string& struct_col_name,
-    const std::shared_ptr<arrow::Table>& front_table,
-    const std::vector<int64_t>& front_indices,
-    const std::vector<int64_t>& front_lt,
-    const std::shared_ptr<arrow::Table>& back_table,
-    int64_t lt_offset,
+    const std::shared_ptr<arrow::Table>& source_table,
+    const std::vector<int64_t>& local_time,   // aligned with source_table rows
     const std::string& output_path,
     const std::shared_ptr<arrow::Schema>& target_schema)
 {
     auto t0 = now_sec();
+    int64_t n_total = source_table->num_rows();
+    LOG("  %s: %ld rows -> %s", label.c_str(), n_total, output_path.c_str());
 
-    // Reorder front rows by merge indices
-    auto front_reordered = [&]{
-        std::vector<uint32_t> idx32(front_indices.size());
-        for (size_t i = 0; i < front_indices.size(); ++i)
-            idx32[i] = static_cast<uint32_t>(front_indices[i]);
-        auto idx_arr = wrap_u32(idx32.data(), static_cast<int64_t>(idx32.size()));
-        return unwrap(
-            arrow::compute::CallFunction("take", {front_table, idx_arr}),
-            "take_front").table();
-    }();
+    if (n_total == 0) {
+        LOG("  %s: no rows, skipping", label.c_str());
+        return;
+    }
 
-    int64_t n_front = front_reordered->num_rows();
-    int64_t n_back = back_table->num_rows();
-    int64_t n_total = n_front + n_back;
-    LOG("  %s: front=%ld back=%ld total=%ld", label.c_str(), n_front, n_back, n_total);
-
-    auto out_schema = target_schema;
-
-    // Open chunked FileWriter (same pattern as Stage 1)
     fs::create_directories(fs::path(output_path).parent_path());
     auto outfile = unwrap(arrow::io::FileOutputStream::Open(output_path), "open_type_out");
     auto wr_props = parquet::WriterProperties::Builder()
@@ -1109,17 +650,12 @@ static void write_type_output(
                         ->store_schema()
                         ->build();
     auto writer = unwrap(parquet::arrow::FileWriter::Open(
-        *out_schema, arrow::default_memory_pool(), outfile, wr_props, ar_props),
+        *target_schema, arrow::default_memory_pool(), outfile, wr_props, ar_props),
         "open_type_writer");
 
-    int serial_col_idx = out_schema->GetFieldIndex("serial");
-    int lt_col_idx     = out_schema->GetFieldIndex("local_time");
-    int et_col_idx     = out_schema->GetFieldIndex("exchange_time");
-
-    // Helper: unnest struct column → flat table matching target_schema.
-    // Reorders columns, casts types, inserts local_time as UInt64, fixes serial.
+    // Unnest struct + build output table matching target_schema
     auto unnest_chunk = [&](const std::shared_ptr<arrow::Table>& tbl,
-                            const int64_t* lt_data, int64_t n, int64_t serial_offset)
+                            int64_t n, int64_t serial_offset, const int64_t* lt_data)
         -> std::shared_ptr<arrow::Table>
     {
         auto sa = std::static_pointer_cast<arrow::StructArray>(
@@ -1131,14 +667,15 @@ static void write_type_output(
         for (int i = 0; i < st->num_fields(); ++i)
             src_map[st->field(i)->name()] = flat_arrays[i];
 
-        arrow::ChunkedArrayVector columns(out_schema->num_fields());
-        for (int ci = 0; ci < out_schema->num_fields(); ++ci) {
-            auto target_field = out_schema->field(ci);
+        arrow::ChunkedArrayVector columns(target_schema->num_fields());
+        for (int ci = 0; ci < target_schema->num_fields(); ++ci) {
+            auto target_field = target_schema->field(ci);
             const auto& col_name = target_field->name();
             auto target_type = target_field->type();
 
             std::shared_ptr<arrow::Array> arr;
             if (col_name == "local_time") {
+                // local_time derived from exchange_time with +1 dedup (precomputed)
                 arr = wrap_u64(lt_data, n);
             } else if (col_name == "serial") {
                 arrow::Int32Builder b;
@@ -1163,8 +700,6 @@ static void write_type_output(
                     auto list_arr = std::static_pointer_cast<arrow::ListArray>(arr);
                     const int64_t list_size = fsl_type->list_size();
                     const int64_t length    = list_arr->length();
-                    // Slice values/null_bitmap to the logical range of this (possibly
-                    // sliced) ListArray so the resulting FSL with offset=0 is correct.
                     auto values = list_arr->values()->Slice(
                         list_arr->value_offset(0), length * list_size);
                     if (!values->type()->Equals(fsl_type->value_type())) {
@@ -1197,24 +732,21 @@ static void write_type_output(
             columns[ci] = std::make_shared<arrow::ChunkedArray>(
                 arrow::ArrayVector{arr});
         }
-        return arrow::Table::Make(out_schema, columns);
+        return arrow::Table::Make(target_schema, columns);
     };
 
-    // Double-buffered chunked write with on-the-fly local_time verification
+    // Chunked write
     std::shared_ptr<arrow::Table> pending;
     arrow::Status write_status;
     std::thread write_thread;
-    int64_t prev_lt = INT64_MIN;
-    int64_t violations = 0;
+    int64_t serial_base = 0;
 
-    auto submit_chunk = [&](std::shared_ptr<arrow::Table> chunk) {
-        auto lt_col = std::static_pointer_cast<arrow::UInt64Array>(
-            combine_chunks(chunk->GetColumnByName("local_time")));
-        for (int64_t i = 0; i < chunk->num_rows(); ++i) {
-            int64_t v = static_cast<int64_t>(lt_col->Value(i));
-            if (v <= prev_lt) ++violations;
-            prev_lt = v;
-        }
+    for (int64_t start = 0; start < n_total; start += CHUNK_SIZE) {
+        int64_t len = std::min(CHUNK_SIZE, n_total - start);
+        auto slice = source_table->Slice(start, len);
+        auto chunk = unnest_chunk(slice, len, serial_base, local_time.data() + start);
+        serial_base += len;
+
         if (write_thread.joinable()) {
             write_thread.join();
             if (!write_status.ok()) {
@@ -1227,32 +759,8 @@ static void write_type_output(
         write_thread = std::thread([&writer, &pending, &write_status]() {
             write_status = writer->WriteTable(*pending, pending->num_rows());
         });
-    };
-
-    // Write front in CHUNK_SIZE slices
-    int64_t serial_base = 0;
-    for (int64_t start = 0; start < n_front; start += CHUNK_SIZE) {
-        int64_t len = std::min(CHUNK_SIZE, n_front - start);
-        auto slice = front_reordered->Slice(start, len);
-        submit_chunk(unnest_chunk(slice, front_lt.data() + start, len, serial_base));
-        serial_base += len;
-    }
-    front_reordered.reset();
-
-    // Write back in CHUNK_SIZE slices (compute local_time per-chunk)
-    for (int64_t start = 0; start < n_back; start += CHUNK_SIZE) {
-        int64_t len = std::min(CHUNK_SIZE, n_back - start);
-        auto slice = back_table->Slice(start, len);
-        auto orig_lt = std::static_pointer_cast<arrow::Int64Array>(
-            combine_chunks(slice->GetColumnByName("local_time")));
-        std::vector<int64_t> chunk_lt(len);
-        for (int64_t i = 0; i < len; ++i)
-            chunk_lt[i] = orig_lt->Value(i) + lt_offset;
-        submit_chunk(unnest_chunk(slice, chunk_lt.data(), len, serial_base));
-        serial_base += len;
     }
 
-    // Flush final pending write
     if (write_thread.joinable()) {
         write_thread.join();
         if (!write_status.ok()) {
@@ -1260,18 +768,10 @@ static void write_type_output(
             std::exit(1);
         }
     }
-
     ARROW_OK(writer->Close());
     ARROW_OK(outfile->Close());
 
-    if (violations > 0)
-        LOG("  WARNING: %s local_time NOT strictly increasing: %ld violations",
-            label.c_str(), violations);
-    else
-        LOG("  %s local_time strictly increasing", label.c_str());
-
-    LOG("  %s written: %ld rows -> %s (%.1fs)",
-        label.c_str(), n_total, output_path.c_str(), now_sec() - t0);
+    LOG("  %s written: %ld rows (%.1fs)", label.c_str(), n_total, now_sec() - t0);
 }
 
 // ── Post-process: fix serial + per-stock split ───────────────────────
@@ -1454,14 +954,10 @@ struct Args {
     std::string date_str;
     std::string data_dir;
     std::string output_dir  = "./output";
-    std::string npy_dir;
-    std::string output_base = "./output/stg2";
+    std::string output_base = "./output";
     std::string log_file;
     bool write_intermediate = false;
     bool post_process       = false;
-    bool delta_npy          = false;
-    bool tick_left_join     = false;
-    bool sh_front_merge    = false;
     bool tick_only          = false;
 };
 
@@ -1472,14 +968,10 @@ static Args parse_args(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--output-dir"     && i+1 < argc) { a.output_dir  = argv[++i]; continue; }
-        if (arg == "--npy-dir"        && i+1 < argc) { a.npy_dir     = argv[++i]; continue; }
         if (arg == "--output-base"    && i+1 < argc) { a.output_base = argv[++i]; continue; }
         if (arg == "--log-file"       && i+1 < argc) { a.log_file    = argv[++i]; continue; }
         if (arg == "--write-intermediate") { a.write_intermediate = true; continue; }
         if (arg == "--post-process")       { a.post_process = true; continue; }
-        if (arg == "--delta-npy")          { a.delta_npy = true; continue; }
-        if (arg == "--tick-left-join")     { a.tick_left_join = true; continue; }
-        if (arg == "--sh-front-merge")    { a.sh_front_merge = true; continue; }
         if (arg == "--tick-only")          { a.tick_only = true; continue; }
         positional.push_back(arg);
     }
@@ -1489,14 +981,10 @@ static Args parse_args(int argc, char* argv[]) {
             "Usage: %s <YYYYMMDD> <data_dir> [options]\n"
             "Options:\n"
             "  --output-dir DIR          Intermediate sorted parquet dir (default: ./output)\n"
-            "  --npy-dir DIR             NPY base dir (enables stage 2 merge)\n"
-            "  --output-base DIR         Stage 2 output base (default: ./output/stg2)\n"
+            "  --output-base DIR         Per-type output base dir (default: ./output)\n"
             "  --write-intermediate      Also write sorted_{date}.parquet\n"
             "  --post-process            Fix serial + split per stock\n"
-            "  --delta-npy               Use delta-encoded NPY format\n"
-            "  --tick-left-join          Tick uses left-join (parquet drives, default: right-join/NPY drives)\n"
-            "  --sh-front-merge         Front: merge SH order+trans per channel by biz_index (default: off)\n"
-            "  --tick-only               Stage 2: only write tick output, skip trans & order\n"
+            "  --tick-only               Only write tick output, skip trans & order\n"
             "  --log-file FILE           Also write log to FILE\n",
             argv[0]);
         std::exit(1);
@@ -1510,11 +998,6 @@ static Args parse_args(int argc, char* argv[]) {
     if (a.date_str.size() != 8) {
         fprintf(stderr, "Invalid date '%s', expected YYYYMMDD\n", a.date_str.c_str());
         std::exit(1);
-    }
-
-    // If npy_dir not specified and no --write-intermediate, default to write intermediate
-    if (a.npy_dir.empty() && !a.write_intermediate) {
-        a.write_intermediate = true;
     }
 
     return a;
@@ -1815,7 +1298,6 @@ int main(int argc, char* argv[])
             *schema, arrow::default_memory_pool(), outfile, wr_props, ar_props),
             "open_writer");
 
-        std::optional<int64_t> prev_last_local;
         int64_t written = 0;
         int n_chunks = 0;
         std::vector<int64_t> cursors_wr = {0, 0, 0};
@@ -1830,11 +1312,9 @@ int main(int argc, char* argv[])
             auto batch_table = build_sorted_batch(
                 merge_src.data() + start, chunk_len,
                 sources_copy, cursors_wr, struct_names, schema);
-            auto local_times = compute_local_time(
-                sort_times_all.data() + start, chunk_len, prev_last_local);
-            prev_last_local = local_times.back();
+            // local_time = exchange_time (sort_times_all already in ns)
             auto lt_buf = unwrap(arrow::AllocateBuffer(chunk_len * sizeof(int64_t)));
-            std::memcpy(lt_buf->mutable_data(), local_times.data(),
+            std::memcpy(lt_buf->mutable_data(), sort_times_all.data() + start,
                         chunk_len * sizeof(int64_t));
             auto lt_arr = std::make_shared<arrow::Int64Array>(chunk_len, std::move(lt_buf));
             auto lt_chunked = std::make_shared<arrow::ChunkedArray>(
@@ -1886,145 +1366,48 @@ int main(int argc, char* argv[])
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // Stage 2: NPY merge + per-type output
+    // Per-type output
     // ══════════════════════════════════════════════════════════════════
 
-    if (!args.npy_dir.empty()) {
+    {
         LOG("============================================================");
-        LOG("Stage 2: NPY merge (npy_dir=%s)", args.npy_dir.c_str());
-
-        // 7. Compute local_time for all rows
+        LOG("Per-type output (local_time = exchange_time, +1 on ties)");
         t0 = now_sec();
-        auto local_times_all = compute_local_time(sort_times_all.data(), total, std::nullopt);
-        LOG("  local_time computed for %ld rows (%.1fs)", total, now_sec() - t0);
 
-        // Add local_time to each source table
-        // sources[i] are in merge order; we need to set their local_time columns
-        {
-            int64_t cursor[3] = {};
-            for (int64_t j = 0; j < total; ++j) {
-                int s = merge_src[j];
-                // We'll set local_time per-source below
-                (void)s;
-            }
-            // Build per-source local_time arrays
-            std::vector<int64_t> lt_per[3];
-            for (int i = 0; i < 3; ++i)
-                lt_per[i].reserve(sources[i]->num_rows());
-            for (int64_t j = 0; j < total; ++j)
-                lt_per[merge_src[j]].push_back(local_times_all[j]);
+        // Compute local_time in global merge order: start from exchange_time (µs),
+        // strictly increasing — if a value is <= previous, bump to previous + 1.
+        std::vector<int64_t> lt_global(total);
+        for (int64_t j = 0; j < total; ++j)
+            lt_global[j] = sort_times_all[j] / 1000; // ns -> µs
+        for (int64_t j = 1; j < total; ++j)
+            if (lt_global[j] <= lt_global[j - 1])
+                lt_global[j] = lt_global[j - 1] + 1;
 
-            for (int i = 0; i < 3; ++i) {
-                auto lt_arr = wrap_i64(lt_per[i].data(),
-                    static_cast<int64_t>(lt_per[i].size()));
-                auto lt_chunked = std::make_shared<arrow::ChunkedArray>(
-                    arrow::ArrayVector{lt_arr});
-                // Find or add local_time column
-                int lt_idx = sources[i]->schema()->GetFieldIndex("local_time");
-                if (lt_idx >= 0) {
-                    sources[i] = unwrap(sources[i]->SetColumn(lt_idx,
-                        arrow::field("local_time", arrow::int64()), lt_chunked), "set_lt_src");
-                } else {
-                    sources[i] = unwrap(sources[i]->AddColumn(
-                        sources[i]->num_columns(),
-                        arrow::field("local_time", arrow::int64()), lt_chunked), "add_lt_src");
-                }
-            }
-        }
-
-        // 8. Split front/back
-        int64_t cutoff_ns = compute_cutoff_ns(args.date_str);
-        LOG("  cutoff_ns=%ld (09:40 CST)", cutoff_ns);
-
-        // sort_times_all is in global merge order (ascending)
-        int64_t n_front = static_cast<int64_t>(
-            std::upper_bound(sort_times_all.begin(), sort_times_all.end(), cutoff_ns)
-            - sort_times_all.begin());
-
-        // Count per-type in front
-        int64_t n_front_per[3] = {};
-        for (int64_t j = 0; j < n_front; ++j) ++n_front_per[merge_src[j]];
-
-        LOG("  front: %ld rows (tick=%ld, order=%ld, trans=%ld)",
-            n_front, n_front_per[0], n_front_per[1], n_front_per[2]);
-        LOG("  back:  %ld rows", total - n_front);
-
-        auto front_tick  = sources[0]->Slice(0, n_front_per[0]);
-        auto front_order = sources[1]->Slice(0, n_front_per[1]);
-        auto front_trans = sources[2]->Slice(0, n_front_per[2]);
-
-        auto back_tick  = sources[0]->Slice(n_front_per[0]);
-        auto back_order = sources[1]->Slice(n_front_per[1]);
-        auto back_trans = sources[2]->Slice(n_front_per[2]);
-
-        // 9. Load NPY
-        t0 = now_sec();
-        LOG("  Loading NPY files (%s mode) ...", args.delta_npy ? "delta" : "classic");
-        npy::TickData    tick_npy;
-        npy::ChannelData trans_npy, order_npy;
-        if (args.delta_npy) {
-            tick_npy  = npy::load_tick(args.npy_dir + "/snapshot.npy");
-            trans_npy = npy::load_delta_channel_dir(args.npy_dir, "trans");
-            order_npy = npy::load_delta_channel_dir(args.npy_dir, "order");
-        } else {
-            tick_npy  = npy::load_tick(
-                args.npy_dir + "/" + args.date_str + "/snapshot.npy");
-            trans_npy = npy::load_channel_dir(
-                args.npy_dir + "/" + args.date_str + "/trans_localtime_by_channel");
-            order_npy = npy::load_channel_dir(
-                args.npy_dir + "/" + args.date_str + "/order_localtime_by_channel");
-        }
-        LOG("  NPY loaded: tick=%ld trans=%ld order=%ld (%.1fs)",
-            tick_npy.n, trans_npy.n, order_npy.n, now_sec() - t0);
-
-        // 10. Join front with NPY
-        LOG("  Joining front with NPY (tick=%s-join) ...",
-            args.tick_left_join ? "left" : "right");
-        auto tick_joined = args.tick_left_join
-            ? join_tick_front_left(front_tick, tick_npy)
-            : join_tick_front(front_tick, tick_npy);
-        auto order_joined = join_channel_front(front_order, order_npy, 1,
-                                               "order_data", "order_index");
-        auto trans_joined = join_channel_front(front_trans, trans_npy, 2,
-                                               "trans_data", "trade_index");
-
-        // 11. Sort front by (local_time, stock_code)
-        LOG("  Sort front (sh_front_merge=%s) ...",
-            args.sh_front_merge ? "on" : "off");
-        auto front_result = kway_merge_front(tick_joined, order_joined, trans_joined);
-
-        // 12. Compute offset
-        int64_t first_back_lt = local_times_all[n_front];
-        int64_t offset = front_result.last_lt + 1 - first_back_lt;
-        LOG("  offset: last_front_lt=%ld, first_back_lt=%ld, offset=%+ld",
-            front_result.last_lt, first_back_lt, offset);
-
-        // 13. Per-type output
-        LOG("============================================================");
-        LOG("Stage 2: Per-type output");
+        // Split per type (aligned with reordered sources[i] rows)
+        std::vector<int64_t> lt_per[3];
+        for (int i = 0; i < 3; ++i)
+            lt_per[i].reserve(sources[i]->num_rows());
+        for (int64_t j = 0; j < total; ++j)
+            lt_per[merge_src[j]].push_back(lt_global[j]);
+        lt_global.clear(); lt_global.shrink_to_fit();
 
         std::string paths[3];
         paths[0] = get_output_path(args.date_str, "1", args.output_base); // tick
         paths[1] = get_output_path(args.date_str, "2", args.output_base); // trans
         paths[2] = get_output_path(args.date_str, "3", args.output_base); // order
 
-        write_type_output("tick", "tick_data",
-            front_tick, front_result.tick_indices, front_result.tick_lt,
-            back_tick, offset, paths[0], make_tick_schema());
+        write_type_output_simple("tick", "tick_data",
+            sources[0], lt_per[0], paths[0], make_tick_schema());
 
         if (!args.tick_only) {
-            write_type_output("trans", "trans_data",
-                front_trans, front_result.trans_indices, front_result.trans_lt,
-                back_trans, offset, paths[1], make_trans_schema());
-
-            write_type_output("order", "order_data",
-                front_order, front_result.order_indices, front_result.order_lt,
-                back_order, offset, paths[2], make_order_schema());
+            write_type_output_simple("trans", "trans_data",
+                sources[2], lt_per[2], paths[1], make_trans_schema());
+            write_type_output_simple("order", "order_data",
+                sources[1], lt_per[1], paths[2], make_order_schema());
         } else {
             LOG("  --tick-only: skipping trans & order output");
         }
 
-        // 14. Post-process (optional)
         if (args.post_process) {
             LOG("============================================================");
             LOG("Post-process: fix serial + split stocks");
@@ -2034,6 +1417,8 @@ int main(int argc, char* argv[])
                 post_process_type("order", paths[2], false);
             }
         }
+
+        LOG("  per-type output done in %.1fs", now_sec() - t0);
     }
 
     // ── Summary ──────────────────────────────────────────────────────
@@ -2045,3 +1430,4 @@ int main(int argc, char* argv[])
     if (g_log_fp) { fclose(g_log_fp); g_log_fp = nullptr; }
     return 0;
 }
+
