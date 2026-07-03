@@ -1374,11 +1374,13 @@ int main(int argc, char* argv[])
         LOG("Per-type output (local_time = exchange_time, +1 on ties)");
         t0 = now_sec();
 
-        // Compute local_time in global merge order: start from exchange_time (µs),
-        // strictly increasing — if a value is <= previous, bump to previous + 1.
+        // Compute local_time in global merge order: base is exchange_time in
+        // NANOSECONDS (sort_times_all is already exchange_time_us * 1000),
+        // strictly increasing — if a value is <= previous, bump to previous + 1
+        // (i.e. +1 nanosecond on ties), matching the legacy pipeline unit.
         std::vector<int64_t> lt_global(total);
         for (int64_t j = 0; j < total; ++j)
-            lt_global[j] = sort_times_all[j] / 1000; // ns -> µs
+            lt_global[j] = sort_times_all[j]; // already ns (exchange_time_us * 1000)
         for (int64_t j = 1; j < total; ++j)
             if (lt_global[j] <= lt_global[j - 1])
                 lt_global[j] = lt_global[j - 1] + 1;

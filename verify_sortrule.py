@@ -13,10 +13,11 @@ Then verify:
   (c) tie order: within equal exchange_time, cross sub-seq (type_priority,
       stock_code) strictly increasing.
 """
+import os
 import sys
 import polars as pl
 
-BASE = "/mnt/beegfs_ssd/public/quant002/hds_work/CppGenSimple"
+BASE = os.environ.get("CHECK_BASE", "/mnt/beegfs_ssd/public/quant002/hds_work/CppGenSimple")
 
 
 def paths(day):
@@ -51,8 +52,15 @@ def main():
 
     # (a) local_time formula: expected lt = cummax over max(et, prev+1)
     #     equivalently lt[j] == max(et[j], lt[j-1]+1).  Build expected via prev lt.
+    # local_time is exchange_time in NANOSECONDS (et is µs); auto-detect the
+    # scale (1 for legacy µs output, 1000 for ns output) so both are supported.
     lt = g["lt"]
-    et = g["et"]
+    et_raw = g["et"]
+    med_lt = lt.filter(lt > 0).median()
+    med_et = et_raw.filter(et_raw > 0).median()
+    scale = 1000 if (med_et and med_lt and round(med_lt / med_et) == 1000) else 1
+    print(f"  lt/et scale = {scale} ({'nanoseconds' if scale == 1000 else 'microseconds'})")
+    et = et_raw * scale
     prev_lt = lt.shift(1)
     # expected[j] = max(et[j], prev_lt[j] + 1) ; expected[0] = et[0]
     expected = pl.select(
