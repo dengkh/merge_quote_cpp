@@ -3,7 +3,7 @@ when:
 
 steps:
   - name: hello
-    image: alpine
+    image: docker.m.daocloud.io/library/alpine
     commands:
       - echo "hello from woodpecker"
       - date
