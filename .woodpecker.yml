@@ -1,0 +1,9 @@
+when:
+  - event: push
+
+steps:
+  - name: hello
+    image: alpine
+    commands:
+      - echo "hello from woodpecker"
+      - date
